@@ -1,0 +1,93 @@
+# LAMMPS input: Graphene in-plane thermal conductivity via Green-Kubo method
+# 使用方法:
+# 1) 准备 data.graphene (units metal, 原子类型为C)
+# 2) 势函数文件 SiC.tersoff 需在同目录（含 C 参数）
+# 3) 运行后在 J0Jt.dat 中得到热流自相关函数，在 kappa_GK.out 中得到累计热导率
+
+clear
+units           metal
+boundary        p p f
+atom_style      atomic
+
+# ---------- System ----------
+read_data       data.graphene
+
+mass            1 12.011
+
+# 可替换为 AIREBO / REBO，示例这里使用 Tersoff
+pair_style      tersoff
+pair_coeff      * * SiC.tersoff C
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+
+timestep        0.001          # 1 fs (metal units)
+
+# ---------- Equilibration ----------
+variable        T equal 300.0
+velocity        all create ${T} 4928459 mom yes rot no dist gaussian
+
+fix             EQ all nvt temp ${T} ${T} 0.1
+thermo          1000
+thermo_style    custom step temp pe ke etotal press
+run             200000         # 200 ps
+unfix           EQ
+
+# ---------- Production (NVE for GK) ----------
+reset_timestep  0
+fix             INT all nve
+
+# per-atom quantities needed by heat/flux
+compute         kea all ke/atom
+compute         pea all pe/atom
+compute         str all stress/atom NULL virial
+compute         J all heat/flux kea pea str
+
+# Volume: 对二维材料常用“有效厚度”3.35 Å
+# 若 data 文件中盒长 z = Lz，实际体积取 A * h = (Lx*Ly*3.35)
+variable        Lx equal lx
+variable        Ly equal ly
+variable        h  equal 3.35
+variable        V2D equal v_Lx*v_Ly*v_h
+
+# Heat flux components (divide by effective volume)
+variable        Jx equal c_J[1]/v_V2D
+variable        Jy equal c_J[2]/v_V2D
+variable        Jz equal c_J[3]/v_V2D
+
+# ---------- HFACF and running kappa ----------
+# p = correlation length; s = sample interval; d = dump interval = p*s
+variable        p equal 20000
+variable        s equal 10
+variable        d equal ${p}*${s}
+
+# autocorrelation of Jx/Jy/Jz
+fix             JJ all ave/correlate ${s} ${p} ${d} \
+                c_J[1] c_J[2] c_J[3] type auto file J0Jt.dat ave running
+
+# Conversion factor for units metal -> W/mK
+# kappa = (1/(kB*T^2*V)) * integral <J(0)J(t)> dt
+# trap(f_JJ[n]) does discrete integration over correlation points
+variable        kB equal 1.380649e-23
+variable        eV2J equal 1.602176634e-19
+variable        A2m equal 1.0e-10
+variable        ps2s equal 1.0e-12
+
+# scale = (eV/ps/A^2)^2 * ps * A^3 / (kB*T^2) -> W/mK
+variable        scale equal (${eV2J}*${eV2J})/(${ps2s}*${A2m})/${kB}/${T}/${T}*${s}*${timestep}
+
+variable        k11 equal trap(f_JJ[3])*${scale}
+variable        k22 equal trap(f_JJ[4])*${scale}
+variable        k33 equal trap(f_JJ[5])*${scale}
+variable        kappa_inplane equal (v_k11+v_k22)/2.0
+
+thermo_style    custom step temp v_Jx v_Jy v_k11 v_k22 v_kappa_inplane
+thermo          ${d}
+
+# 输出热导率演化
+fix             KOUT all print ${d} "${step} ${k11} ${k22} ${k33} ${kappa_inplane}" \
+                file kappa_GK.out screen no title "Step kxx[W/mK] kyy[W/mK] kzz[W/mK] kinplane[W/mK]"
+
+run             2000000        # 2 ns
+
+write_restart   graphene_gk.restart
